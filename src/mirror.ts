@@ -1,6 +1,16 @@
+import 'dotenv/config';
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { ArkeClient } from './services/arke-client.js';
+import { OpenAIClient } from './services/openai-client.js';
+import { PineconeClient } from './services/pinecone-client.js';
+import { ParentResolver } from './services/parent-resolver.js';
+import { loadConfig } from './adapters/nara/config.js';
+import { extractText } from './adapters/nara/field-extractor.js';
+import { extractMetadata } from './adapters/nara/metadata-extractor.js';
+import { getNamespace } from './adapters/nara/namespace-resolver.js';
+import type { PineconeVector } from './services/pinecone-client.js';
 
 // Get __dirname equivalent in ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -54,21 +64,62 @@ interface MirrorState {
   backoff_seconds: number;
   last_poll_time: string | null;
   total_entities: number;
+
+  // Pinecone integration (optional)
+  pinecone?: {
+    enabled: boolean;
+    last_processed_event_cid: string | null;  // Checkpoint in event stream
+    processed_count: number;                   // Total vectors upserted
+    failed_count: number;                      // Total failures
+    skipped_count: number;                     // Entities with no text
+    last_processed_time: string | null;        // ISO timestamp
+    queue_size: number;                        // Current queue size
+  };
+}
+
+interface ProcessingItem {
+  pi: string;
+  text: string;
+  namespace: string;
+  metadata: Record<string, any>;
 }
 
 class ArkeIPFSMirror {
-  private apiBaseUrl: string;
+  private backendApiUrl: string;  // Backend API (port 3000) - events, snapshots
+  private arkeApiUrl: string;      // Wrapper API (port 8787) - entity CRUD
   private state: MirrorState;
   private stateFilePath: string;
   private dataFilePath: string;
   private minBackoff = 30;
   private maxBackoff = 600;
 
-  constructor(apiBaseUrl: string, stateFilePath?: string, dataFilePath?: string) {
-    this.apiBaseUrl = apiBaseUrl;
+  // Pinecone integration fields
+  private pineconeEnabled: boolean;
+  private pineconeQueue: Event[] = [];
+  private pineconeProcessing: boolean = false;
+  private maxQueueSize: number = 100;
+  private lastPineconeProcessTime: number = 0;
+  private shouldStopPolling: boolean = false;
+
+  private arkeClient?: ArkeClient;
+  private openaiClient?: OpenAIClient;
+  private pineconeClient?: PineconeClient;
+  private parentResolver?: ParentResolver;
+  private naraConfig?: any;
+
+  constructor(backendApiUrl: string, arkeApiUrl: string, stateFilePath?: string, dataFilePath?: string) {
+    this.backendApiUrl = backendApiUrl;
+    this.arkeApiUrl = arkeApiUrl;
     this.stateFilePath = stateFilePath || join(dirname(__dirname), 'mirror-state.json');
     this.dataFilePath = dataFilePath || join(dirname(__dirname), 'mirror-data.jsonl');
     this.state = this.loadState();
+
+    // Initialize Pinecone settings from environment
+    this.pineconeEnabled = process.env.ENABLE_PINECONE === 'true';
+
+    if (this.pineconeEnabled) {
+      console.log('Pinecone integration enabled');
+    }
   }
 
   private loadState(): MirrorState {
@@ -99,6 +150,125 @@ class ArkeIPFSMirror {
     }
   }
 
+  private async initializePinecone(): Promise<void> {
+    console.log('Initializing Pinecone integration...');
+
+    // Get configuration
+    const configPath = process.env.CONFIG_PATH || './config/nara-config.json';
+    const openaiKey = process.env.OPENAI_API_KEY;
+    const pineconeKey = process.env.PINECONE_API_KEY;
+
+    if (!openaiKey) {
+      throw new Error('OPENAI_API_KEY environment variable required for Pinecone integration');
+    }
+    if (!pineconeKey) {
+      throw new Error('PINECONE_API_KEY environment variable required for Pinecone integration');
+    }
+
+    // Load config
+    console.log('Loading config from: ' + configPath);
+    this.naraConfig = loadConfig(configPath);
+
+    // Initialize services (use wrapper API for entity operations)
+    this.arkeClient = new ArkeClient(this.arkeApiUrl);
+    this.openaiClient = new OpenAIClient(
+      openaiKey,
+      this.naraConfig.embedding_model,
+      this.naraConfig.embedding_dimensions
+    );
+    this.pineconeClient = new PineconeClient(
+      pineconeKey,
+      'arke-institute',
+      this.naraConfig.embedding_dimensions
+    );
+    this.parentResolver = new ParentResolver(this.arkeClient);
+
+    // Ensure index exists
+    console.log('Ensuring Pinecone index exists...');
+    await this.pineconeClient.ensureIndex();
+
+    // Initialize state if first time
+    if (!this.state.pinecone) {
+      this.state.pinecone = {
+        enabled: true,
+        last_processed_event_cid: null,
+        processed_count: 0,
+        failed_count: 0,
+        skipped_count: 0,
+        last_processed_time: null,
+        queue_size: 0
+      };
+      this.saveState();
+    }
+
+    console.log('Pinecone initialization complete');
+
+    // Backfill if needed
+    await this.backfillPinecone();
+  }
+
+  private async backfillPinecone(): Promise<void> {
+    if (!this.state.pinecone) {
+      return;
+    }
+
+    if (this.state.pinecone.last_processed_event_cid) {
+      // Already initialized, check if we need to catch up
+      const lastProcessed = this.state.pinecone.last_processed_event_cid;
+      const currentCursor = this.state.cursor_event_cid;
+
+      if (lastProcessed !== currentCursor) {
+        console.log('Pinecone behind mirror cursor, catching up...');
+        console.log(`  Last processed: ${lastProcessed}`);
+        console.log(`  Current cursor: ${currentCursor}`);
+        // For now, we'll just note this - full catch-up logic would require
+        // reading events from JSONL between these two points
+      }
+      return;
+    }
+
+    // First time: Read entire JSONL and queue everything
+    console.log('First time Pinecone setup - reading all historical data...');
+
+    if (!existsSync(this.dataFilePath)) {
+      console.log('No historical data file found, starting fresh');
+      return;
+    }
+
+    const allEvents = this.readAllEventsFromJSONL();
+    console.log(`Found ${allEvents.length} events to index`);
+
+    this.pineconeQueue.push(...allEvents);
+    this.state.pinecone.queue_size = this.pineconeQueue.length;
+    this.saveState();
+
+    // Start processing
+    this.startPineconeProcessing();
+  }
+
+  private readAllEventsFromJSONL(): Event[] {
+    const content = readFileSync(this.dataFilePath, 'utf-8');
+    const lines = content.trim().split('\n');
+
+    return lines
+      .filter(line => line.trim())
+      .map(line => {
+        const data = JSON.parse(line);
+        // Convert EntityEntry to Event format if needed
+        if (!data.type) {
+          return {
+            pi: data.pi,
+            ver: data.ver,
+            tip_cid: data.tip_cid,
+            type: 'create' as const,
+            ts: data.ts || new Date().toISOString(),
+            event_cid: data.tip_cid // Best guess
+          };
+        }
+        return data as Event;
+      });
+  }
+
   private appendData(data: EntityEntry | Event): void {
     try {
       appendFileSync(this.dataFilePath, JSON.stringify(data) + '\n', 'utf-8');
@@ -106,6 +276,180 @@ class ArkeIPFSMirror {
       console.error('Error appending data:', error);
       throw error;
     }
+
+    // Add to Pinecone queue if enabled
+    if (this.pineconeEnabled) {
+      const event = this.toEvent(data);
+      this.pineconeQueue.push(event);
+
+      // Trigger processing if queue is full
+      if (this.pineconeQueue.length >= this.maxQueueSize) {
+        console.log(`Pinecone queue full (${this.pineconeQueue.length}), triggering batch`);
+        this.startPineconeProcessing();
+      }
+    }
+  }
+
+  private toEvent(data: EntityEntry | Event): Event {
+    if ('type' in data) {
+      return data as Event;
+    }
+
+    // Convert EntityEntry to Event
+    return {
+      pi: data.pi,
+      ver: data.ver,
+      tip_cid: data.tip_cid,
+      type: 'create',
+      ts: new Date().toISOString(),
+      event_cid: data.tip_cid
+    };
+  }
+
+  private startPineconeProcessing(): void {
+    if (this.pineconeProcessing) {
+      console.log('Pinecone processing already running, skipping...');
+      return;
+    }
+
+    if (this.pineconeQueue.length === 0) {
+      return;
+    }
+
+    // Fire and forget (don't await)
+    this.processPineconeQueue().catch(error => {
+      console.error('Pinecone processing error:', error);
+      this.pineconeProcessing = false;
+    });
+  }
+
+  private async processPineconeQueue(): Promise<void> {
+    this.pineconeProcessing = true;
+
+    try {
+      while (this.pineconeQueue.length > 0) {
+        console.log(`\n[Pinecone] Processing batch (targeting 100 items with text)...`);
+
+        try {
+          // Keep processing events until we have 100 items with text or run out of queue
+          const result = await this.processPineconeBatch();
+
+          console.log(`[Pinecone] Batch complete: ${result.processed} items upserted, ${result.skipped} skipped, ${result.failed} failed`);
+        } catch (error) {
+          console.error('[Pinecone] Batch processing failed:', error);
+        }
+
+        // Update state
+        if (this.state.pinecone) {
+          this.state.pinecone.queue_size = this.pineconeQueue.length;
+        }
+        this.saveState();
+
+        console.log(`[Pinecone] Queue remaining: ${this.pineconeQueue.length} events`);
+      }
+    } finally {
+      this.pineconeProcessing = false;
+      this.lastPineconeProcessTime = Date.now();
+    }
+  }
+
+  private async processPineconeBatch(): Promise<{ processed: number; skipped: number; failed: number }> {
+    const items: ProcessingItem[] = [];
+    const targetBatchSize = 100;
+    let skipped = 0;
+    let failed = 0;
+    let lastEventCid: string | null = null;
+
+    // Keep pulling from queue until we have 100 items with text, or queue is empty
+    while (items.length < targetBatchSize && this.pineconeQueue.length > 0) {
+      const event = this.pineconeQueue.shift()!;
+      lastEventCid = event.event_cid;
+
+      try {
+        // Fetch entity + catalog
+        const { manifest, catalog } = await this.arkeClient!.getEntityWithCatalog(event.pi);
+
+        // Extract namespace
+        const namespace = getNamespace(catalog.schema, this.naraConfig!);
+
+        // Extract schema type for field extraction
+        const schemaType = this.naraConfig!.namespace_mapping[catalog.schema] || 'unknown';
+
+        // Extract text for embedding
+        const text = extractText(catalog, schemaType, this.naraConfig!);
+
+        // Skip if no text
+        if (!text || text.trim().length === 0) {
+          console.log(`  [SKIP] ${event.pi} - no text`);
+          skipped++;
+          if (this.state.pinecone) {
+            this.state.pinecone.skipped_count++;
+          }
+          continue;
+        }
+
+        // Get parent ancestry
+        const ancestry = await this.parentResolver!.getAncestry(event.pi);
+
+        // Extract metadata
+        const metadata = extractMetadata(catalog, manifest, ancestry, this.naraConfig!);
+
+        items.push({ pi: event.pi, text, namespace, metadata });
+
+        console.log(`  [OK] ${event.pi} - ${text.length} chars, ns: ${namespace}`);
+      } catch (error) {
+        console.error(`  [FAIL] ${event.pi} -`, error);
+        failed++;
+        if (this.state.pinecone) {
+          this.state.pinecone.failed_count++;
+        }
+      }
+    }
+
+    // Skip if no items
+    if (items.length === 0) {
+      console.log('  No items with text in this batch');
+      return { processed: 0, skipped, failed };
+    }
+
+    // Generate embeddings
+    console.log(`  Generating embeddings for ${items.length} items...`);
+    const texts = items.map(item => item.text);
+    const embeddings = await this.openaiClient!.createEmbeddings(texts);
+
+    // Group by namespace
+    const byNamespace: Record<string, { item: ProcessingItem; embedding: number[] }[]> = {};
+    items.forEach((item, idx) => {
+      if (!byNamespace[item.namespace]) {
+        byNamespace[item.namespace] = [];
+      }
+      byNamespace[item.namespace].push({ item, embedding: embeddings[idx] });
+    });
+
+    // Upsert to Pinecone
+    let totalUpserted = 0;
+    for (const [namespace, namespaceItems] of Object.entries(byNamespace)) {
+      const vectors: PineconeVector[] = namespaceItems.map(({ item, embedding }) => ({
+        id: item.pi,
+        values: embedding,
+        metadata: item.metadata
+      }));
+
+      await this.pineconeClient!.upsert(namespace, vectors);
+      totalUpserted += vectors.length;
+      if (this.state.pinecone) {
+        this.state.pinecone.processed_count += vectors.length;
+      }
+      console.log(`  [UPSERT] ${vectors.length} vectors to ${namespace}`);
+    }
+
+    // Update checkpoint (last event processed)
+    if (lastEventCid && this.state.pinecone) {
+      this.state.pinecone.last_processed_event_cid = lastEventCid;
+      this.state.pinecone.last_processed_time = new Date().toISOString();
+    }
+
+    return { processed: totalUpserted, skipped, failed };
   }
 
   // Phase 1: Bulk Sync
@@ -114,7 +458,7 @@ class ArkeIPFSMirror {
     console.log('Downloading snapshot...');
 
     try {
-      const response = await fetch(`${this.apiBaseUrl}/snapshot/latest`);
+      const response = await fetch(`${this.backendApiUrl}/snapshot/latest`);
 
       if (response.status === 404) {
         console.log('No snapshot exists yet - system is new');
@@ -168,7 +512,7 @@ class ArkeIPFSMirror {
     try {
       while (true) {
         pollCount++;
-        let url = `${this.apiBaseUrl}/events?limit=100`;
+        let url = `${this.backendApiUrl}/events?limit=100`;
         if (apiCursor) {
           url += `&cursor=${apiCursor}`;
         }
@@ -244,6 +588,11 @@ class ArkeIPFSMirror {
       console.log(`  - Last poll: ${this.state.last_poll_time || 'never'}`);
       console.log(`  - Current backoff: ${this.state.backoff_seconds}s`);
     }
+
+    // Initialize Pinecone if enabled
+    if (this.pineconeEnabled) {
+      await this.initializePinecone();
+    }
   }
 
   // Main poll loop
@@ -256,6 +605,11 @@ class ArkeIPFSMirror {
     console.log('Starting continuous polling with exponential backoff...\n');
 
     while (true) {
+      if (this.shouldStopPolling) {
+        console.log('Polling stopped');
+        break;
+      }
+
       console.log(`[${new Date().toISOString()}] Polling for updates...`);
 
       try {
@@ -274,6 +628,15 @@ class ArkeIPFSMirror {
           console.log(`  No updates, backing off to ${this.state.backoff_seconds}s`);
         }
 
+        // Periodic Pinecone queue flush (every 5 minutes)
+        if (this.pineconeEnabled && this.pineconeQueue.length > 0) {
+          const timeSinceLastProcess = Date.now() - this.lastPineconeProcessTime;
+          if (timeSinceLastProcess > 5 * 60 * 1000) {  // 5 minutes
+            console.log(`Flushing Pinecone queue (${this.pineconeQueue.length} items)...`);
+            this.startPineconeProcessing();
+          }
+        }
+
         this.saveState();
       } catch (error) {
         console.error('Poll error:', error);
@@ -290,7 +653,8 @@ class ArkeIPFSMirror {
   // Complete workflow
   async run(): Promise<void> {
     console.log('=== Arke IPFS Mirror Starting ===');
-    console.log(`API Base URL: ${this.apiBaseUrl}`);
+    console.log(`Backend API URL: ${this.backendApiUrl} (events, snapshots)`);
+    console.log(`Wrapper API URL: ${this.arkeApiUrl} (entity CRUD)`);
     console.log(`State File: ${this.stateFilePath}`);
     console.log(`Data File: ${this.dataFilePath}\n`);
 
@@ -302,6 +666,36 @@ class ArkeIPFSMirror {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  stopPolling(): void {
+    this.shouldStopPolling = true;
+  }
+
+  async flushPineconeQueue(): Promise<void> {
+    if (!this.pineconeEnabled || this.pineconeQueue.length === 0) {
+      return;
+    }
+
+    console.log(`Flushing Pinecone queue (${this.pineconeQueue.length} items)...`);
+
+    // If already processing, wait for it to complete
+    if (this.pineconeProcessing) {
+      console.log('Waiting for current processing to complete...');
+      // Wait with timeout
+      const maxWait = 60000; // 60 seconds
+      const startTime = Date.now();
+      while (this.pineconeProcessing && (Date.now() - startTime) < maxWait) {
+        await this.sleep(1000);
+      }
+    }
+
+    // Process any remaining items
+    if (this.pineconeQueue.length > 0) {
+      await this.processPineconeQueue();
+    }
+
+    console.log('Pinecone queue flushed');
+  }
+
   // Utility: Get current stats
   getStats() {
     return {
@@ -310,25 +704,38 @@ class ArkeIPFSMirror {
       connected: this.state.connected,
       backoff_seconds: this.state.backoff_seconds,
       last_poll_time: this.state.last_poll_time,
+      pinecone: this.state.pinecone
     };
   }
 }
 
 // Main entry point
 async function main() {
-  // Get API base URL from environment or use default
-  const apiBaseUrl = process.env.ARKE_API_URL || 'http://localhost:3000';
+  // Get API URLs from environment or use defaults
+  const backendApiUrl = process.env.BACKEND_API_URL || 'http://localhost:3000';
+  const arkeApiUrl = process.env.ARKE_API_URL || 'http://localhost:8787';
 
   // Get file paths from environment (for Docker/Fly.io deployment)
   const stateFilePath = process.env.STATE_FILE_PATH;
   const dataFilePath = process.env.DATA_FILE_PATH;
 
-  const mirror = new ArkeIPFSMirror(apiBaseUrl, stateFilePath, dataFilePath);
+  const mirror = new ArkeIPFSMirror(backendApiUrl, arkeApiUrl, stateFilePath, dataFilePath);
 
   // Handle graceful shutdown
-  process.on('SIGINT', () => {
-    console.log('\n\nShutting down gracefully...');
+  process.on('SIGINT', async () => {
+    console.log('\n\nGraceful shutdown initiated...');
+
+    // Stop accepting new items
+    mirror.stopPolling();
+
+    // Flush remaining Pinecone queue
+    await mirror.flushPineconeQueue();
+
+    // Save final state
+    console.log('Saving final state...');
     console.log('Final stats:', mirror.getStats());
+
+    console.log('Shutdown complete');
     process.exit(0);
   });
 

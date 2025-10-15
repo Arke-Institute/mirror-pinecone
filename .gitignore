@@ -11,5 +11,8 @@ dist/
 mirror-data.jsonl
 mirror-state.json
 
+# Log files
+*.log
+
 # OS files
 .DS_Store
