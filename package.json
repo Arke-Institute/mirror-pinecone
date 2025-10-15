@@ -9,12 +9,22 @@
     "start": "node --enable-source-maps dist/mirror.js",
     "dev": "tsc && npm start"
   },
-  "keywords": ["arke", "ipfs", "mirror"],
+  "keywords": [
+    "arke",
+    "ipfs",
+    "mirror"
+  ],
   "author": "",
   "license": "MIT",
   "devDependencies": {
+    "@types/lodash": "^4.14.202",
     "@types/node": "^20.10.0",
     "typescript": "^5.3.3"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@pinecone-database/pinecone": "^2.0.0",
+    "dotenv": "^17.2.3",
+    "lodash": "^4.17.21",
+    "openai": "^4.20.0"
+  }
 }

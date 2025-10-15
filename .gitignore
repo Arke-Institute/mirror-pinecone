@@ -1,0 +1,15 @@
+# Environment variables
+.env
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime data
+mirror-data.jsonl
+mirror-state.json
+
+# OS files
+.DS_Store
