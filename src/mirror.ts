@@ -213,22 +213,42 @@ class ArkeIPFSMirror {
     }
 
     if (this.state.pinecone.last_processed_event_cid) {
-      // Already initialized, check if we need to catch up
+      // Already initialized - check if we need to catch up using /events API
       const lastProcessed = this.state.pinecone.last_processed_event_cid;
       const currentCursor = this.state.cursor_event_cid;
 
       if (lastProcessed !== currentCursor) {
-        console.log('Pinecone behind mirror cursor, catching up...');
+        console.log('Pinecone behind mirror cursor, catching up via /events API...');
         console.log(`  Last processed: ${lastProcessed}`);
         console.log(`  Current cursor: ${currentCursor}`);
-        // For now, we'll just note this - full catch-up logic would require
-        // reading events from JSONL between these two points
+
+        try {
+          // Walk backwards from current cursor to find the gap
+          const gapEvents = await this.getEventsGap(lastProcessed, currentCursor);
+
+          if (gapEvents.length > 0) {
+            console.log(`Queueing ${gapEvents.length} events for Pinecone processing...`);
+            this.pineconeQueue.push(...gapEvents);
+            this.state.pinecone.queue_size = this.pineconeQueue.length;
+            this.saveState();
+
+            // Start processing
+            this.startPineconeProcessing();
+          } else {
+            console.log('No gap events found - already up to date');
+          }
+        } catch (error) {
+          console.error('Failed to catch up via /events API:', error);
+          console.error('Pinecone will remain at checkpoint and catch up as new events arrive');
+        }
+      } else {
+        console.log('Pinecone checkpoint matches mirror cursor - up to date');
       }
       return;
     }
 
-    // First time: Read entire JSONL and queue everything
-    console.log('First time Pinecone setup - reading all historical data...');
+    // First time: Read entire JSONL and queue everything (snapshot data)
+    console.log('First time Pinecone setup - reading all historical data from snapshot...');
 
     if (!existsSync(this.dataFilePath)) {
       console.log('No historical data file found, starting fresh');
@@ -236,7 +256,7 @@ class ArkeIPFSMirror {
     }
 
     const allEvents = this.readAllEventsFromJSONL();
-    console.log(`Found ${allEvents.length} events to index`);
+    console.log(`Found ${allEvents.length} entities to index from snapshot`);
 
     this.pineconeQueue.push(...allEvents);
     this.state.pinecone.queue_size = this.pineconeQueue.length;
@@ -572,6 +592,66 @@ class ArkeIPFSMirror {
       return { updates };
     } catch (error) {
       console.error('Sync from cursor failed:', error);
+      throw error;
+    }
+  }
+
+  // Get events between two event CIDs by walking backwards from current to target
+  private async getEventsGap(fromEventCid: string, toEventCid: string | null): Promise<Event[]> {
+    console.log(`  Walking /events API from ${toEventCid || 'HEAD'} back to ${fromEventCid}...`);
+
+    let apiCursor: string | undefined = undefined;
+    const gapEvents: Event[] = [];
+    let foundTarget = false;
+    let pollCount = 0;
+
+    try {
+      while (true) {
+        pollCount++;
+        let url = `${this.backendApiUrl}/events?limit=100`;
+        if (apiCursor) {
+          url += `&cursor=${apiCursor}`;
+        }
+
+        const response = await fetch(url);
+
+        if (!response.ok) {
+          throw new Error(`Events fetch failed: ${response.status}`);
+        }
+
+        const data = await response.json() as EventsResponse;
+
+        for (const event of data.items) {
+          // Stop when we reach the target checkpoint
+          if (event.event_cid === fromEventCid) {
+            foundTarget = true;
+            console.log(`  ✓ Found checkpoint at event CID: ${event.event_cid}`);
+            break;
+          }
+
+          // Collect events newer than the checkpoint
+          gapEvents.push(event);
+        }
+
+        if (foundTarget) {
+          break;
+        }
+
+        if (!data.has_more) {
+          // Reached end of chain without finding checkpoint
+          console.log(`  ✗ Checkpoint ${fromEventCid} not found in event chain`);
+          throw new Error(`Checkpoint event_cid ${fromEventCid} not found in event stream`);
+        }
+
+        apiCursor = data.next_cursor;
+      }
+
+      // Return events in chronological order (reverse since we walked backwards)
+      const orderedEvents = gapEvents.reverse();
+      console.log(`  Found ${orderedEvents.length} events to catch up (${pollCount} API calls)`);
+      return orderedEvents;
+    } catch (error) {
+      console.error('Failed to get events gap:', error);
       throw error;
     }
   }
