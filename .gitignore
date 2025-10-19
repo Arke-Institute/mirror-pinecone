@@ -18,3 +18,5 @@ mirror-state.json
 .DS_Store
 
 update/*
+
+aws-instance-info.txt
