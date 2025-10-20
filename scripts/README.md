@@ -43,6 +43,21 @@ Or run interactively (prompts for region and instance name):
 
 **Time:** ~5-10 minutes
 
+### 3. Check Status
+
+After deployment, check the mirror health:
+
+```bash
+./scripts/status.sh
+```
+
+Shows:
+- EC2 instance state
+- Docker container status
+- Mirror statistics (entities, last poll, backoff)
+- Pinecone stats (processed, failed, skipped)
+- Recent log output
+
 ---
 
 ## Prerequisites
@@ -141,6 +156,41 @@ Complete Docker-based deployment to AWS EC2.
 - Data volume: `/var/lib/arke-mirror` (persists state)
 - Restart policy: `unless-stopped`
 - Environment: All variables from `.env`
+
+---
+
+### `status.sh`
+
+Check the health and status of a deployed mirror.
+
+**Usage:**
+```bash
+./scripts/status.sh
+```
+
+**What it shows:**
+- EC2 instance state (running, stopped, terminated)
+- Docker container status and uptime
+- Mirror statistics:
+  - Phase (bulk_sync or polling)
+  - Total entities synced
+  - Last poll time
+  - Current backoff interval
+- Pinecone statistics:
+  - Vectors processed
+  - Failed count
+  - Skipped count
+  - Queue size
+- Last 10 log lines
+
+**Requirements:**
+- `aws-instance-info.txt` must exist (created by deploy script)
+- AWS CLI configured
+- SSH access to instance
+
+**Exit codes:**
+- `0` - Mirror is healthy
+- `1` - Error (instance not found, container not running, etc.)
 
 ---
 
