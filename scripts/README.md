@@ -58,6 +58,22 @@ Shows:
 - Pinecone stats (processed, failed, skipped)
 - Recent log output
 
+### 4. Monitor (Optional)
+
+For continuous monitoring:
+
+```bash
+./scripts/monitor.sh
+```
+
+Auto-refreshes status every 10 seconds. Press Ctrl+C to exit.
+
+Or just follow logs:
+
+```bash
+./scripts/monitor.sh --logs
+```
+
 ---
 
 ## Prerequisites
@@ -191,6 +207,36 @@ Check the health and status of a deployed mirror.
 **Exit codes:**
 - `0` - Mirror is healthy
 - `1` - Error (instance not found, container not running, etc.)
+
+---
+
+### `monitor.sh`
+
+Live monitoring dashboard with auto-refresh.
+
+**Usage:**
+```bash
+./scripts/monitor.sh              # Dashboard mode (refresh every 10s)
+./scripts/monitor.sh --interval 5 # Custom refresh interval
+./scripts/monitor.sh --logs       # Just follow Docker logs
+```
+
+**Dashboard Mode:**
+Displays a continuously updating dashboard showing:
+- Instance and container status
+- Mirror statistics with live updates
+- Pinecone processing stats
+- Recent log output
+
+Press Ctrl+C to exit.
+
+**Logs Mode:**
+Follows Docker logs in real-time (equivalent to `docker logs -f`).
+
+**Options:**
+- `--interval N` - Set refresh interval in seconds (default: 10)
+- `--logs` - Follow logs instead of dashboard
+- `--help` - Show usage information
 
 ---
 
