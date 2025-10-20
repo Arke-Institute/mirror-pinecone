@@ -176,9 +176,10 @@ class ArkeIPFSMirror {
       this.naraConfig.embedding_model,
       this.naraConfig.embedding_dimensions
     );
+    const indexName = process.env.PINECONE_INDEX_NAME || 'arke-institute';
     this.pineconeClient = new PineconeClient(
       pineconeKey,
-      'arke-institute',
+      indexName,
       this.naraConfig.embedding_dimensions
     );
     this.parentResolver = new ParentResolver(this.arkeClient);
