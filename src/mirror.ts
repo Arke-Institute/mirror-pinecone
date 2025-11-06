@@ -6,10 +6,11 @@ import { ArkeClient } from './services/arke-client.js';
 import { OpenAIClient } from './services/openai-client.js';
 import { PineconeClient } from './services/pinecone-client.js';
 import { ParentResolver } from './services/parent-resolver.js';
-import { loadConfig } from './adapters/nara/config.js';
-import { extractText } from './adapters/nara/field-extractor.js';
-import { extractMetadata } from './adapters/nara/metadata-extractor.js';
-import { getNamespace } from './adapters/nara/namespace-resolver.js';
+import { loadConfig } from './adapters/pinax/config.js';
+import { extractText } from './adapters/pinax/field-extractor.js';
+import { extractMetadata } from './adapters/pinax/metadata-extractor.js';
+import { getNamespace } from './adapters/pinax/namespace-resolver.js';
+import type { PinaxMetadata } from './adapters/pinax/field-extractor.js';
 import type { PineconeVector } from './services/pinecone-client.js';
 
 // Get __dirname equivalent in ES modules
@@ -105,7 +106,7 @@ class ArkeIPFSMirror {
   private openaiClient?: OpenAIClient;
   private pineconeClient?: PineconeClient;
   private parentResolver?: ParentResolver;
-  private naraConfig?: any;
+  private pinaxConfig?: any;
 
   constructor(backendApiUrl: string, arkeApiUrl: string, stateFilePath?: string, dataFilePath?: string) {
     this.backendApiUrl = backendApiUrl;
@@ -154,7 +155,7 @@ class ArkeIPFSMirror {
     console.log('Initializing Pinecone integration...');
 
     // Get configuration
-    const configPath = process.env.CONFIG_PATH || './config/nara-config.json';
+    const configPath = process.env.CONFIG_PATH || './config/pinax-config.json';
     const openaiKey = process.env.OPENAI_API_KEY;
     const pineconeKey = process.env.PINECONE_API_KEY;
 
@@ -166,21 +167,21 @@ class ArkeIPFSMirror {
     }
 
     // Load config
-    console.log('Loading config from: ' + configPath);
-    this.naraConfig = loadConfig(configPath);
+    console.log('Loading PINAX config from: ' + configPath);
+    this.pinaxConfig = loadConfig(configPath);
 
     // Initialize services (use wrapper API for entity operations)
     this.arkeClient = new ArkeClient(this.arkeApiUrl);
     this.openaiClient = new OpenAIClient(
       openaiKey,
-      this.naraConfig.embedding_model,
-      this.naraConfig.embedding_dimensions
+      this.pinaxConfig.embedding_model,
+      this.pinaxConfig.embedding_dimensions
     );
     const indexName = process.env.PINECONE_INDEX_NAME || 'arke-institute';
     this.pineconeClient = new PineconeClient(
       pineconeKey,
       indexName,
-      this.naraConfig.embedding_dimensions
+      this.pinaxConfig.embedding_dimensions
     );
     this.parentResolver = new ParentResolver(this.arkeClient);
 
@@ -387,17 +388,17 @@ class ArkeIPFSMirror {
       lastEventCid = event.event_cid;
 
       try {
-        // Fetch entity + catalog
-        const { manifest, catalog } = await this.arkeClient!.getEntityWithCatalog(event.pi);
+        // Fetch entity + pinax.json + description.md
+        const { manifest, pinax, description } = await this.arkeClient!.getEntityWithPinax(event.pi);
 
-        // Extract namespace
-        const namespace = getNamespace(catalog.schema, this.naraConfig!);
+        // Type assertion for PINAX metadata
+        const pinaxData = pinax as PinaxMetadata;
 
-        // Extract schema type for field extraction
-        const schemaType = this.naraConfig!.namespace_mapping[catalog.schema] || 'unknown';
+        // Extract namespace from institution (not entity type)
+        const namespace = getNamespace(pinaxData.institution);
 
         // Extract text for embedding
-        const text = extractText(catalog, schemaType, this.naraConfig!);
+        const text = extractText(pinaxData, description, this.pinaxConfig!);
 
         // Skip if no text
         if (!text || text.trim().length === 0) {
@@ -413,11 +414,11 @@ class ArkeIPFSMirror {
         const ancestry = await this.parentResolver!.getAncestry(event.pi);
 
         // Extract metadata
-        const metadata = extractMetadata(catalog, manifest, ancestry, this.naraConfig!);
+        const metadata = extractMetadata(pinaxData, manifest, ancestry);
 
         items.push({ pi: event.pi, text, namespace, metadata });
 
-        console.log(`  [OK] ${event.pi} - ${text.length} chars, ns: ${namespace}`);
+        console.log(`  [OK] ${event.pi} - ${text.length} chars, ns: ${namespace}, institution: ${pinaxData.institution}`);
       } catch (error) {
         console.error(`  [FAIL] ${event.pi} -`, error);
         failed++;

@@ -1,0 +1,9 @@
+{
+  "text_limits": {
+    "max_chars": 20000,
+    "max_words": 5000
+  },
+  "embedding_model": "text-embedding-3-small",
+  "embedding_dimensions": 768,
+  "batch_size": 100
+}

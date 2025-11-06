@@ -106,4 +106,83 @@ export class ArkeClient {
 
     return null;
   }
+
+  /**
+   * Fetch a specific component by name
+   * @param pi Entity persistent identifier
+   * @param componentName Component name (e.g., "pinax.json", "description.md")
+   * @returns Component data as JSON or null if not found
+   */
+  async getComponent(pi: string, componentName: string): Promise<any | null> {
+    try {
+      const manifest = await this.getEntity(pi);
+
+      if (!manifest.components || !(componentName in manifest.components)) {
+        return null;
+      }
+
+      const cid = manifest.components[componentName];
+      return await this.getCatalogRecord(cid);
+    } catch (error) {
+      console.warn(`Failed to get component ${componentName} for ${pi}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch a text component (e.g., description.md)
+   * @param pi Entity persistent identifier
+   * @param componentName Component name
+   * @returns Component text content or null if not found
+   */
+  async getComponentText(pi: string, componentName: string): Promise<string | null> {
+    try {
+      const manifest = await this.getEntity(pi);
+
+      if (!manifest.components || !(componentName in manifest.components)) {
+        return null;
+      }
+
+      const cid = manifest.components[componentName];
+      const url = this.baseUrl + '/cat/' + cid;
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        return null;
+      }
+
+      return await response.text();
+    } catch (error) {
+      console.warn(`Failed to get text component ${componentName} for ${pi}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch entity with pinax.json and description.md
+   * @param pi Entity persistent identifier
+   * @returns Entity manifest, pinax.json, and description.md
+   */
+  async getEntityWithPinax(pi: string): Promise<{
+    manifest: EntityManifest;
+    pinax: any;
+    description: string | null;
+  }> {
+    const manifest = await this.getEntity(pi);
+
+    // Get pinax.json (required)
+    const pinax = await this.getComponent(pi, 'pinax.json');
+    if (!pinax) {
+      throw new Error(`No pinax.json component found in entity ${pi}`);
+    }
+
+    // Get description.md (optional)
+    const description = await this.getComponentText(pi, 'description.md');
+
+    return {
+      manifest,
+      pinax,
+      description
+    };
+  }
 }
